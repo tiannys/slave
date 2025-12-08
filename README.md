@@ -1,5 +1,7 @@
 # 🎮 SLAVE - Multiplayer Card Game
 
+https://slave-beta.vercel.app/
+
 Real-time multiplayer card game built with Next.js and deployed on Vercel. Play the classic "Slave" (President/Scum) card game with friends online!
 
 ## ✨ Features
