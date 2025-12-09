@@ -10,7 +10,7 @@ export async function POST(
 ) {
     try {
         const { roomId } = await params;
-        const result = startGame(roomId);
+        const result = await startGame(roomId);
 
         if (!result.success) {
             return NextResponse.json(

@@ -1,23 +1,22 @@
 import { GameRoom, Player, Card } from './types';
 import { createDeck, distributeCards, getStartingPlayer } from './gameLogic';
+import { db } from './firebaseConfig';
+import {
+    collection,
+    doc,
+    getDoc,
+    setDoc,
+    updateDoc,
+    deleteDoc,
+    getDocs,
+    query,
+    where,
+    serverTimestamp,
+    Timestamp,
+} from 'firebase/firestore';
 
-// In-memory storage for game rooms
-const gameRooms = new Map<string, GameRoom>();
-
-// Auto-cleanup inactive rooms (older than 30 minutes)
+const ROOMS_COLLECTION = 'rooms';
 const ROOM_TIMEOUT = 30 * 60 * 1000; // 30 minutes
-
-function cleanupInactiveRooms() {
-    const now = Date.now();
-    for (const [roomId, room] of gameRooms.entries()) {
-        if (now - room.lastActivity > ROOM_TIMEOUT) {
-            gameRooms.delete(roomId);
-        }
-    }
-}
-
-// Run cleanup every 5 minutes
-setInterval(cleanupInactiveRooms, 5 * 60 * 1000);
 
 /**
  * Generate a random room ID
@@ -34,9 +33,31 @@ function generatePlayerId(): string {
 }
 
 /**
+ * Clean up inactive rooms (called on-demand)
+ */
+async function cleanupInactiveRooms() {
+    try {
+        const roomsRef = collection(db, ROOMS_COLLECTION);
+        const snapshot = await getDocs(roomsRef);
+        const now = Date.now();
+
+        const deletePromises = snapshot.docs
+            .filter(doc => {
+                const room = doc.data() as GameRoom;
+                return now - room.lastActivity > ROOM_TIMEOUT;
+            })
+            .map(doc => deleteDoc(doc.ref));
+
+        await Promise.all(deletePromises);
+    } catch (error) {
+        console.error('Error cleaning up rooms:', error);
+    }
+}
+
+/**
  * Create a new game room
  */
-export function createRoom(playerName: string): { roomId: string; playerId: string } {
+export async function createRoom(playerName: string): Promise<{ roomId: string; playerId: string }> {
     const roomId = generateRoomId();
     const playerId = generatePlayerId();
 
@@ -56,7 +77,7 @@ export function createRoom(playerName: string): { roomId: string; playerId: stri
         playArea: [],
         lastPlay: null,
         currentRoundWinner: null,
-        passedPlayers: new Set(),
+        passedPlayers: [],
         createdAt: Date.now(),
         lastActivity: Date.now(),
         roundNumber: 1,
@@ -64,231 +85,344 @@ export function createRoom(playerName: string): { roomId: string; playerId: stri
         turnTimeLimit: 30000, // 30 seconds
     };
 
-    gameRooms.set(roomId, room);
+    await setDoc(doc(db, ROOMS_COLLECTION, roomId), room);
     return { roomId, playerId };
 }
 
 /**
  * Get a room by ID
  */
-export function getRoom(roomId: string): GameRoom | null {
-    const room = gameRooms.get(roomId);
-    if (!room) return null;
+export async function getRoom(roomId: string): Promise<GameRoom | null> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    // Check for auto-pass if turn timer expired (only during playing phase)
-    if (room.phase === 'playing') {
-        const now = Date.now();
-        const turnDuration = now - room.turnStartTime;
+        if (!roomSnap.exists()) {
+            return null;
+        }
 
-        if (turnDuration >= room.turnTimeLimit) {
-            // Auto-pass the current player's turn
-            const currentPlayer = room.players[room.currentTurn];
-            if (currentPlayer && currentPlayer.isActive) {
-                console.log(`Auto-passing turn for player ${currentPlayer.name} (timeout)`);
-                passTurn(roomId, currentPlayer.id);
+        const room = roomSnap.data() as GameRoom;
+
+        // Check for auto-pass if turn timer expired (only during playing phase)
+        if (room.phase === 'playing') {
+            const now = Date.now();
+            const turnDuration = now - room.turnStartTime;
+
+            if (turnDuration >= room.turnTimeLimit) {
+                // Auto-pass the current player's turn
+                const currentPlayer = room.players[room.currentTurn];
+                if (currentPlayer && currentPlayer.isActive) {
+                    console.log(`Auto-passing turn for player ${currentPlayer.name} (timeout)`);
+                    await passTurn(roomId, currentPlayer.id);
+                    // Re-fetch the room after auto-pass
+                    const updatedSnap = await getDoc(roomRef);
+                    return updatedSnap.exists() ? (updatedSnap.data() as GameRoom) : null;
+                }
             }
         }
-    }
 
-    // Update last activity
-    room.lastActivity = Date.now();
-    return room;
+        // Update last activity
+        await updateDoc(roomRef, {
+            lastActivity: Date.now(),
+        });
+
+        return room;
+    } catch (error) {
+        console.error('Error getting room:', error);
+        return null;
+    }
 }
 
 /**
  * Get all active rooms
  */
-export function getAllRooms(): GameRoom[] {
-    cleanupInactiveRooms();
-    return Array.from(gameRooms.values());
+export async function getAllRooms(): Promise<GameRoom[]> {
+    try {
+        // Clean up inactive rooms first
+        await cleanupInactiveRooms();
+
+        const roomsRef = collection(db, ROOMS_COLLECTION);
+        const snapshot = await getDocs(roomsRef);
+
+        return snapshot.docs.map(doc => doc.data() as GameRoom);
+    } catch (error) {
+        console.error('Error getting all rooms:', error);
+        return [];
+    }
 }
 
 /**
  * Add a player to a room
  */
-export function joinRoom(
+export async function joinRoom(
     roomId: string,
     playerName: string
-): { success: boolean; playerId?: string; error?: string } {
-    const room = gameRooms.get(roomId);
+): Promise<{ success: boolean; playerId?: string; error?: string }> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    if (!room) {
-        return { success: false, error: 'Room not found' };
+        if (!roomSnap.exists()) {
+            return { success: false, error: 'Room not found' };
+        }
+
+        const room = roomSnap.data() as GameRoom;
+
+        if (room.phase !== 'waiting') {
+            return { success: false, error: 'Game already started' };
+        }
+
+        if (room.players.length >= 4) {
+            return { success: false, error: 'Room is full' };
+        }
+
+        if (room.players.some(p => p.name === playerName)) {
+            return { success: false, error: 'Name already taken' };
+        }
+
+        const playerId = generatePlayerId();
+        const player: Player = {
+            id: playerId,
+            name: playerName,
+            hand: [],
+            cardsRemaining: 0,
+            isActive: true,
+        };
+
+        room.players.push(player);
+        room.lastActivity = Date.now();
+
+        await updateDoc(roomRef, {
+            players: room.players,
+            lastActivity: room.lastActivity,
+        });
+
+        return { success: true, playerId };
+    } catch (error) {
+        console.error('Error joining room:', error);
+        return { success: false, error: 'Failed to join room' };
     }
-
-    if (room.phase !== 'waiting') {
-        return { success: false, error: 'Game already started' };
-    }
-
-    if (room.players.length >= 4) {
-        return { success: false, error: 'Room is full' };
-    }
-
-    if (room.players.some(p => p.name === playerName)) {
-        return { success: false, error: 'Name already taken' };
-    }
-
-    const playerId = generatePlayerId();
-    const player: Player = {
-        id: playerId,
-        name: playerName,
-        hand: [],
-        cardsRemaining: 0,
-        isActive: true,
-    };
-
-    room.players.push(player);
-    room.lastActivity = Date.now();
-
-    return { success: true, playerId };
 }
 
 /**
  * Remove a player from a room
  */
-export function leaveRoom(roomId: string, playerId: string): boolean {
-    const room = gameRooms.get(roomId);
-    if (!room) return false;
+export async function leaveRoom(roomId: string, playerId: string): Promise<boolean> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    room.players = room.players.filter(p => p.id !== playerId);
-    room.lastActivity = Date.now();
+        if (!roomSnap.exists()) {
+            return false;
+        }
 
-    // Delete room if empty
-    if (room.players.length === 0) {
-        gameRooms.delete(roomId);
+        const room = roomSnap.data() as GameRoom;
+        room.players = room.players.filter(p => p.id !== playerId);
+
+        // Delete room if empty
+        if (room.players.length === 0) {
+            await deleteDoc(roomRef);
+        } else {
+            await updateDoc(roomRef, {
+                players: room.players,
+                lastActivity: Date.now(),
+            });
+        }
+
+        return true;
+    } catch (error) {
+        console.error('Error leaving room:', error);
+        return false;
     }
-
-    return true;
 }
 
 /**
  * Start the game (distribute cards)
  */
-export function startGame(roomId: string): { success: boolean; error?: string } {
-    const room = gameRooms.get(roomId);
+export async function startGame(roomId: string): Promise<{ success: boolean; error?: string }> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    if (!room) {
-        return { success: false, error: 'Room not found' };
+        if (!roomSnap.exists()) {
+            return { success: false, error: 'Room not found' };
+        }
+
+        const room = roomSnap.data() as GameRoom;
+
+        if (room.players.length !== 4) {
+            return { success: false, error: 'Need exactly 4 players to start' };
+        }
+
+        if (room.phase !== 'waiting') {
+            return { success: false, error: 'Game already started' };
+        }
+
+        // Create and distribute cards
+        const deck = createDeck();
+        const hands = distributeCards(deck);
+
+        room.players.forEach((player, index) => {
+            player.hand = hands[index];
+            player.cardsRemaining = hands[index].length;
+        });
+
+        // Determine starting player
+        room.currentTurn = getStartingPlayer(room.players);
+        room.phase = 'playing';
+        room.turnStartTime = Date.now();
+        room.lastActivity = Date.now();
+
+        await updateDoc(roomRef, {
+            players: room.players,
+            currentTurn: room.currentTurn,
+            phase: room.phase,
+            turnStartTime: room.turnStartTime,
+            lastActivity: room.lastActivity,
+        });
+
+        return { success: true };
+    } catch (error) {
+        console.error('Error starting game:', error);
+        return { success: false, error: 'Failed to start game' };
     }
-
-    if (room.players.length !== 4) {
-        return { success: false, error: 'Need exactly 4 players to start' };
-    }
-
-    if (room.phase !== 'waiting') {
-        return { success: false, error: 'Game already started' };
-    }
-
-    // Create and distribute cards
-    const deck = createDeck();
-    const hands = distributeCards(deck);
-
-    room.players.forEach((player, index) => {
-        player.hand = hands[index];
-        player.cardsRemaining = hands[index].length;
-    });
-
-    // Determine starting player
-    room.currentTurn = getStartingPlayer(room.players);
-    room.phase = 'playing';
-    room.turnStartTime = Date.now(); // Start turn timer
-    room.lastActivity = Date.now();
-
-    return { success: true };
 }
 
 /**
  * Play cards from a player's hand
  */
-export function playCards(
+export async function playCards(
     roomId: string,
     playerId: string,
     cards: Card[]
-): { success: boolean; error?: string } {
-    const room = gameRooms.get(roomId);
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    if (!room) {
-        return { success: false, error: 'Room not found' };
+        if (!roomSnap.exists()) {
+            return { success: false, error: 'Room not found' };
+        }
+
+        const room = roomSnap.data() as GameRoom;
+
+        const player = room.players.find(p => p.id === playerId);
+        if (!player) {
+            return { success: false, error: 'Player not found' };
+        }
+
+        const currentPlayer = room.players[room.currentTurn];
+        if (currentPlayer.id !== playerId) {
+            return { success: false, error: 'Not your turn' };
+        }
+
+        // Remove played cards from hand
+        const cardIds = cards.map(c => c.id);
+        player.hand = player.hand.filter(c => !cardIds.includes(c.id));
+        player.cardsRemaining = player.hand.length;
+
+        // Add to play area
+        const play = {
+            playerId: player.id,
+            playerName: player.name,
+            cards: cards,
+            timestamp: Date.now(),
+        };
+
+        room.playArea.push(play);
+        room.lastPlay = play;
+        room.currentRoundWinner = playerId;
+        room.passedPlayers = []; // Reset passed players
+
+        // Check if player finished all cards
+        if (player.hand.length === 0) {
+            player.isActive = false;
+        }
+
+        // Move to next active player
+        moveToNextPlayer(room);
+        room.turnStartTime = Date.now(); // Reset turn timer for next player
+        room.lastActivity = Date.now();
+
+        await updateDoc(roomRef, {
+            players: room.players,
+            playArea: room.playArea,
+            lastPlay: room.lastPlay,
+            currentRoundWinner: room.currentRoundWinner,
+            passedPlayers: room.passedPlayers,
+            currentTurn: room.currentTurn,
+            phase: room.phase,
+            turnStartTime: room.turnStartTime,
+            lastActivity: room.lastActivity,
+        });
+
+        return { success: true };
+    } catch (error) {
+        console.error('Error playing cards:', error);
+        return { success: false, error: 'Failed to play cards' };
     }
-
-    const player = room.players.find(p => p.id === playerId);
-    if (!player) {
-        return { success: false, error: 'Player not found' };
-    }
-
-    const currentPlayer = room.players[room.currentTurn];
-    if (currentPlayer.id !== playerId) {
-        return { success: false, error: 'Not your turn' };
-    }
-
-    // Remove played cards from hand
-    const cardIds = cards.map(c => c.id);
-    player.hand = player.hand.filter(c => !cardIds.includes(c.id));
-    player.cardsRemaining = player.hand.length;
-
-    // Add to play area
-    const play = {
-        playerId: player.id,
-        playerName: player.name,
-        cards: cards,
-        timestamp: Date.now(),
-    };
-
-    room.playArea.push(play);
-    room.lastPlay = play;
-    room.currentRoundWinner = playerId;
-    room.passedPlayers.clear(); // Reset passed players
-
-    // Check if player finished all cards
-    if (player.hand.length === 0) {
-        player.isActive = false;
-    }
-
-    // Move to next active player
-    moveToNextPlayer(room);
-    room.turnStartTime = Date.now(); // Reset turn timer for next player
-    room.lastActivity = Date.now();
-
-    return { success: true };
 }
 
 /**
  * Pass turn (player cannot or chooses not to play)
  */
-export function passTurn(
+export async function passTurn(
     roomId: string,
     playerId: string
-): { success: boolean; error?: string } {
-    const room = gameRooms.get(roomId);
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        const roomRef = doc(db, ROOMS_COLLECTION, roomId);
+        const roomSnap = await getDoc(roomRef);
 
-    if (!room) {
-        return { success: false, error: 'Room not found' };
+        if (!roomSnap.exists()) {
+            return { success: false, error: 'Room not found' };
+        }
+
+        const room = roomSnap.data() as GameRoom;
+
+        const currentPlayer = room.players[room.currentTurn];
+        if (currentPlayer.id !== playerId) {
+            return { success: false, error: 'Not your turn' };
+        }
+
+        // Add to passed players array
+        if (!room.passedPlayers.includes(playerId)) {
+            room.passedPlayers.push(playerId);
+        }
+
+        // Check if all active players except winner have passed
+        const activePlayers = room.players.filter(p => p.isActive);
+        const passedCount = room.passedPlayers.filter(
+            id => room.players.find(p => p.id === id)?.isActive
+        ).length;
+
+        if (passedCount === activePlayers.length - 1) {
+            // New round - winner starts
+            startNewRound(room);
+        } else {
+            // Move to next player
+            moveToNextPlayer(room);
+        }
+
+        room.turnStartTime = Date.now(); // Reset turn timer
+        room.lastActivity = Date.now();
+
+        await updateDoc(roomRef, {
+            passedPlayers: room.passedPlayers,
+            currentTurn: room.currentTurn,
+            phase: room.phase,
+            playArea: room.playArea,
+            lastPlay: room.lastPlay,
+            roundNumber: room.roundNumber,
+            turnStartTime: room.turnStartTime,
+            lastActivity: room.lastActivity,
+        });
+
+        return { success: true };
+    } catch (error) {
+        console.error('Error passing turn:', error);
+        return { success: false, error: 'Failed to pass turn' };
     }
-
-    const currentPlayer = room.players[room.currentTurn];
-    if (currentPlayer.id !== playerId) {
-        return { success: false, error: 'Not your turn' };
-    }
-
-    room.passedPlayers.add(playerId);
-
-    // Check if all active players except winner have passed
-    const activePlayers = room.players.filter(p => p.isActive);
-    const passedCount = Array.from(room.passedPlayers).filter(
-        id => room.players.find(p => p.id === id)?.isActive
-    ).length;
-
-    if (passedCount === activePlayers.length - 1) {
-        // New round - winner starts
-        startNewRound(room);
-    } else {
-        // Move to next player
-        moveToNextPlayer(room);
-    }
-
-    room.turnStartTime = Date.now(); // Reset turn timer
-    room.lastActivity = Date.now();
-    return { success: true };
 }
 
 /**
@@ -318,7 +452,7 @@ function moveToNextPlayer(room: GameRoom) {
 function startNewRound(room: GameRoom) {
     room.playArea = [];
     room.lastPlay = null;
-    room.passedPlayers.clear();
+    room.passedPlayers = [];
 
     // Winner of last round starts
     if (room.currentRoundWinner) {

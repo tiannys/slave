@@ -10,7 +10,7 @@ export async function GET(
 ) {
     try {
         const { roomId } = await params;
-        const room = getRoom(roomId);
+        const room = await getRoom(roomId);
 
         if (!room) {
             return NextResponse.json(

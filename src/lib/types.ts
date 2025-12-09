@@ -35,7 +35,7 @@ export interface GameRoom {
     playArea: PlayedCards[];
     lastPlay: PlayedCards | null;
     currentRoundWinner: string | null; // Player ID of current round winner
-    passedPlayers: Set<string>; // Players who passed this round
+    passedPlayers: string[]; // Players who passed this round (changed from Set for Firestore)
     createdAt: number;
     lastActivity: number;
     roundNumber: number;

@@ -16,7 +16,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const { roomId, playerId } = createRoom(playerName.trim());
+        const { roomId, playerId } = await createRoom(playerName.trim());
 
         return NextResponse.json({
             roomId,
@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
  */
 export async function GET() {
     try {
-        const rooms = getAllRooms();
+        const rooms = await getAllRooms();
 
         // Return minimal room info (don't expose player hands)
         const roomList = rooms.map(room => ({
