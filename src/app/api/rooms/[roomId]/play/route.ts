@@ -23,7 +23,7 @@ export async function POST(
 
         // Handle pass action
         if (action === 'pass') {
-            const result = passTurn(roomId, playerId);
+            const result = await passTurn(roomId, playerId);
 
             if (!result.success) {
                 return NextResponse.json(
@@ -45,7 +45,7 @@ export async function POST(
             );
         }
 
-        const room = getRoom(roomId);
+        const room = await getRoom(roomId);
         if (!room) {
             return NextResponse.json(
                 { error: 'Room not found' },
@@ -83,7 +83,7 @@ export async function POST(
         }
 
         // Execute play
-        const result = playCards(roomId, playerId, selectedCards);
+        const result = await playCards(roomId, playerId, selectedCards);
 
         if (!result.success) {
             return NextResponse.json(
